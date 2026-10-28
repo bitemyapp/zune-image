@@ -1401,8 +1401,14 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // https://github.com/google/libultrahdr
                 *stream.seen_eoi() = true;
             } else if let Marker::RST(_) = m {
-                // A latched RST means the entropy segment is already exhausted.
-                self.handle_rst(stream)?;
+                // A latched RST ends the entropy segment once its MCUs are decoded or its
+                // bits are used up. A segment can end in the next row (the restart interval
+                // needn't divide the MCUs in a row), with its last MCUs still in the bit
+                // buffer: resetting the stream now would drop them, and the restart is handled
+                // when the interval is counted out instead.
+                if self.todo == 0 || bits_left == 0 {
+                    self.handle_rst(stream)?;
+                }
             } else if let Marker::SOS = m {
                 self.parse_marker_inner(Marker::SOS)?;
                 self.invalidate_scan_checkpoint();
