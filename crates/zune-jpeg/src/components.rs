@@ -18,6 +18,7 @@ use zune_core::log::trace;
 
 use crate::alloc::string::ToString;
 use crate::decoder::MAX_COMPONENTS;
+use crate::idct::scaled::AverageFn;
 use crate::errors::DecodeErrors;
 use crate::upsampler::upsample_no_op;
 const MAX_SAMP_FACTOR: usize = 4;
@@ -58,6 +59,15 @@ pub(crate) struct Components {
     pub up_sampler: UpSampler,
     /// How pixels do we need to go to get to the next line?
     pub width_stride: usize,
+    /// Samples between the rows of decoded samples, which is `width_stride` unless the
+    /// image is decoded at a reduced size.
+    pub sample_stride: usize,
+    /// Samples each block of the component is reconstructed to across and down: 8 unless
+    /// the image is decoded at a reduced size.
+    pub block_w: usize,
+    pub block_h: usize,
+    /// How blocks other than 8 by 8 are reduced from reconstructed ones.
+    pub scaled_average: Option<AverageFn>,
     /// Component ID for progressive
     pub id: u8,
     /// Whether we need to decode this image component.
@@ -161,6 +171,10 @@ impl Components {
             up_sampler: upsample_no_op,
             // set later
             width_stride: horizontal_sample,
+            sample_stride: horizontal_sample,
+            block_w: 8,
+            block_h: 8,
+            scaled_average: None,
             id: a[0],
             needed: true,
             raw_coeff: vec![],

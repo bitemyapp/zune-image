@@ -37,9 +37,10 @@ use crate::headers::{
     parse_start_of_frame, with_marker_body
 };
 use crate::huffman::HuffmanTable;
+use crate::idct::scaled::choose_average;
 use crate::idct::{choose_idct_1x1_func, choose_idct_4x4_func, choose_idct_func};
 use crate::marker::Marker;
-use crate::misc::SOFMarkers;
+use crate::misc::{calculate_padded_width, SOFMarkers};
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
     generic_sampler, upsample_no_op
@@ -379,6 +380,9 @@ pub struct JpegDecoder<T> {
     pub(crate) icc_data:                    Vec<ICCChunk>,
     pub(crate) is_mjpeg:                    bool,
     pub(crate) coeff:                       usize, // Solves some weird bug :)
+    /// Samples a block of the most sampled component is reconstructed to across and down:
+    /// 8, or 4, 2 or 1 when decoding pixels at a reduced size.
+    pub(crate) block_size:                  (usize, usize),
     /// Extended XMP segments
     pub(crate) extended_xmp_segments: Vec<ExtendedXmpSegment>,
     /// Total Extended XMP payload bytes committed so far.
@@ -2058,6 +2062,7 @@ where
             icc_data:                    vec![],
             is_mjpeg:                    false,
             coeff:                       1,
+            block_size:                  (8, 8),
             extended_xmp_segments:       vec![],
             extended_xmp_bytes_received: 0,
             header_resume_position:      0,
@@ -2189,8 +2194,10 @@ where
         if !self.headers_decoded {
             return None;
         }
+        let (across, down) = self.output_scale();
         usize::from(self.width())
-            .checked_mul(height)?
+            .div_ceil(across)
+            .checked_mul(height.div_ceil(down))?
             .checked_mul(self.options.jpeg_get_out_colorspace().num_components())
     }
 
@@ -2265,12 +2272,12 @@ where
     #[must_use]
     pub fn decoded_preview_scanlines(&self) -> Option<usize> {
         let preview_bytes = self.decoded_preview_output_bytes()?;
-        let row_stride = usize::from(self.width())
+        let row_stride = self.output_dimensions()?.0
             .checked_mul(self.options.jpeg_get_out_colorspace().num_components())?;
         if row_stride == 0 || preview_bytes == 0 {
             return Some(0);
         }
-        Some((preview_bytes / row_stride).min(usize::from(self.height())))
+        Some((preview_bytes / row_stride).min(self.output_dimensions()?.1))
     }
 
     /// Return whether incremental mode is enabled.
@@ -2314,13 +2321,13 @@ where
     #[must_use]
     pub fn decoded_scanlines(&self) -> Option<usize> {
         let decoded_output_bytes = self.decoded_output_bytes()?;
-        let row_stride = usize::from(self.width())
+        let row_stride = self.output_dimensions()?.0
             .checked_mul(self.options.jpeg_get_out_colorspace().num_components())?;
         if row_stride == 0 {
             return Some(0);
         }
 
-        Some((decoded_output_bytes / row_stride).min(usize::from(self.height())))
+        Some((decoded_output_bytes / row_stride).min(self.output_dimensions()?.1))
     }
 
     /// Begin an exclusive raw component-output session.
@@ -3887,6 +3894,107 @@ where
         } else {
             None
         };
+    }
+
+    /// The size of the decoded output, as a tuple of width and height, or `None` if the
+    /// headers haven't been decoded.
+    ///
+    /// This is [`Self::dimensions`] reduced by the scales set with
+    /// `DecoderOptions::jpeg_set_scale_denominators`, where the image can be decoded at them,
+    /// and rounded up.
+    #[must_use]
+    pub fn output_dimensions(&self) -> Option<(usize, usize)> {
+        let (width, height) = self.dimensions()?;
+        let (across, down) = self.output_scale();
+
+        Some((width.div_ceil(across), height.div_ceil(down)))
+    }
+
+    /// The denominators of the scales `decode` and `decode_into` reconstruct the image at
+    /// across and down: the requested ones, or 1 and 1 where they aren't supported.
+    /// Subsampled components are reconstructed at the output's resolution, so a component
+    /// sampled `n` times less than the most sampled one in a direction needs a denominator of
+    /// at least `n / 2` in it (blocks of at most 16 samples a side). Images with a DNL marker, and grayscale output
+    /// of vertically subsampled color images, decode at full size.
+    pub(crate) fn output_scale(&self) -> (usize, usize) {
+        let (across, down) = self.options.jpeg_get_scale_denominators();
+        let (across, down) = (usize::from(across), usize::from(down));
+        if (across <= 1 && down <= 1) || !self.headers_decoded || self.expects_dnl {
+            return (1, 1);
+        }
+
+        let components = &self.components;
+        let h_max = components.iter().map(|c| c.horizontal_sample).max().unwrap_or(1);
+        let v_max = components.iter().map(|c| c.vertical_sample).max().unwrap_or(1);
+        let (mut h_ratio, mut v_ratio) = (1, 1);
+        for component in components {
+            let (h, v) = (component.horizontal_sample, component.vertical_sample);
+            if h == 0 || v == 0 || h_max % h != 0 || v_max % v != 0 {
+                return (1, 1);
+            }
+            h_ratio = h_ratio.max(h_max / h);
+            v_ratio = v_ratio.max(v_max / v);
+        }
+
+        // Grayscale output of a vertically subsampled color image decodes the luma component
+        // with a different stripe layout, which reduced sizes don't handle.
+        if components.len() > 1
+            && self.options.jpeg_get_out_colorspace().num_components() == 1
+            && v_max > 1
+        {
+            return (1, 1);
+        }
+
+        // A component sampled `ratio` times less than the most sampled one is reconstructed at
+        // `ratio` times the block size, which can't exceed 16 (a reconstructed block's samples
+        // repeated twice).
+        let fits = |denominator: usize, ratio: usize| 8 / denominator * ratio <= 16;
+        if fits(across, h_ratio) && fits(down, v_ratio) {
+            (across, down)
+        } else {
+            (1, 1)
+        }
+    }
+
+    /// Set up the components' reconstructed block sizes for decoding at `output_scale`, or at
+    /// full size when `scaled` is false (outputs other than pixels).
+    pub(crate) fn set_block_sizes(&mut self, scaled: bool) {
+        let (across, down) = if scaled { self.output_scale() } else { (1, 1) };
+        self.block_size = (8 / across, 8 / down);
+
+        let h_max = self.components.iter().map(|c| c.horizontal_sample).max().unwrap_or(1);
+        let v_max = self.components.iter().map(|c| c.vertical_sample).max().unwrap_or(1);
+        let (scaled, block_size) = (self.is_scaled(), self.block_size);
+        for component in &mut self.components {
+            if !scaled {
+                component.block_w = 8;
+                component.block_h = 8;
+                component.sample_stride = component.width_stride;
+                component.scaled_average = None;
+            } else {
+                component.block_w = block_size.0 * h_max / component.horizontal_sample;
+                component.block_h = block_size.1 * v_max / component.vertical_sample;
+                component.sample_stride = component.width_stride / 8 * component.block_w;
+                component.scaled_average = choose_average(component.block_w, component.block_h);
+            }
+        }
+    }
+
+    /// The width of an output row, and of the rows of decoded samples it's converted from.
+    pub(crate) fn output_row_geometry(&self) -> (usize, usize) {
+        let width = usize::from(self.info.width);
+        if self.is_scaled() {
+            let across = 8 / self.block_size.0;
+            let padded = self.components.iter().map(|c| c.sample_stride).max().unwrap_or(0);
+            (width.div_ceil(across), padded)
+        } else {
+            (width, calculate_padded_width(width, self.info.sample_ratio))
+        }
+    }
+
+    /// Whether the image is being decoded at a reduced size.
+    pub(crate) fn is_scaled(&self) -> bool {
+        self.block_size != (8, 8)
     }
 }
 

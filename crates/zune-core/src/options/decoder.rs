@@ -154,6 +154,12 @@ pub struct DecoderOptions {
     /// - Default value:100
     /// - Respected by: `jpeg`
     max_scans:          usize,
+    /// Scales the jpeg decoder reconstructs the image at across and down, as the
+    /// denominators of fractions of its size (1, 2, 4 or 8).
+    ///
+    /// - Default value: (1, 1)
+    /// - Respected by: `jpeg`
+    jpeg_scale_denominators: (u8, u8),
     /// Maximum size for deflate.
     /// Respected by all decoders that use inflate/deflate
     deflate_limit:      usize,
@@ -438,6 +444,41 @@ impl DecoderOptions {
         self.max_scans = max_scans;
         self
     }
+    /// Get the scales the jpeg decoder reconstructs the image at across and down, as the
+    /// denominators of fractions of its size: 1 (full size), 2, 4 or 8.
+    pub const fn jpeg_get_scale_denominators(&self) -> (u8, u8) {
+        self.jpeg_scale_denominators
+    }
+
+    /// Reconstruct the image at 1/2, 1/4 or 1/8 of its size (`denominator` 2, 4 or 8), as
+    /// libjpeg's `scale_denom` does: each output sample is the mean of the samples it covers,
+    /// computed without reconstructing the image at full size.
+    ///
+    /// The same as [`Self::jpeg_set_scale_denominators`] with both denominators the same.
+    #[must_use]
+    pub fn jpeg_set_scale_denominator(self, denominator: u8) -> Self {
+        self.jpeg_set_scale_denominators(denominator, denominator)
+    }
+
+    /// Reconstruct the image at 1/2, 1/4 or 1/8 of its width and, separately, of its height,
+    /// for images that will be drawn smaller in one direction than in the other. Values other
+    /// than 1, 2, 4 and 8 are rounded down to one of them.
+    ///
+    /// The decoder may decode at a larger scale (down to full size) where a reduction isn't
+    /// supported, so read the output size from the decoder after decoding headers. Scaling
+    /// applies to `decode` and `decode_into`.
+    #[must_use]
+    pub fn jpeg_set_scale_denominators(mut self, horizontal: u8, vertical: u8) -> Self {
+        let round = |denominator: u8| match denominator {
+            8.. => 8,
+            4..=7 => 4,
+            2..=3 => 2,
+            _ => 1
+        };
+        self.jpeg_scale_denominators = (round(horizontal), round(vertical));
+        self
+    }
+
     /// Get expected output colorspace set by the user for which the image
     /// is expected to be reconstructed into.
     ///
@@ -721,6 +762,7 @@ impl Default for DecoderOptions {
             max_width:          1 << 14,
             max_height:         1 << 14,
             max_scans:          100,
+            jpeg_scale_denominators: (1, 1),
             deflate_limit:      1 << 30,
             flags:              decoder_error_tolerance_mode(),
             // 16 mb

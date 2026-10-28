@@ -24,7 +24,8 @@ use crate::errors::DecodeErrors;
 use crate::headers::parse_sos;
 use crate::marker::Marker;
 use crate::mcu::DCT_BLOCK;
-use crate::misc::{calculate_padded_width, setup_component_params};
+use crate::idct::scaled::dc_mean;
+use crate::misc::setup_component_params;
 
 const PROGRESSIVE_CHECKPOINT_ROW_INTERVAL: usize = 8;
 
@@ -79,6 +80,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         scan_block: &mut [Vec<i16>; MAX_COMPONENTS], upsampler_scratch: &mut Vec<i16>,
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
+        // Only pixel output is reconstructed at a reduced size.
+        let scaled = matches!(output, McuDecodeOutput::Pixels(_)) && self.output_scale() != (1, 1);
         let mut mcu_height;
         let mut mcu_width;
 
@@ -91,6 +94,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             // this helps us catch component errors.
             self.set_upsampling();
         }
+        self.set_block_sizes(scaled);
         if self.is_interleaved {
             mcu_width = self.mcu_x;
             mcu_height = self.mcu_y;
@@ -954,7 +958,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         };
 
         // Size of our output image(width*height)
-        let is_hv = usize::from(self.is_interleaved);
+        let is_hv = usize::from(self.is_interleaved && !self.is_scaled());
         let upsampler_scratch_size = is_hv
             * self
                 .components
@@ -963,8 +967,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 .max()
                 .unwrap_or(0)
             * 8;
-        let width = usize::from(self.info.width);
-        let padded_width = calculate_padded_width(width, self.info.sample_ratio);
+        let (width, padded_width) = self.output_row_geometry();
 
         upsampler_scratch_space.clear();
         upsampler_scratch_space.resize(upsampler_scratch_size, 0);
@@ -990,7 +993,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // allocate enough space to hold a whole MCU width
                 // this means we should take into account sampling ratios
                 // `*8` is because each MCU spans 8 widths.
-                let len = comp.width_stride * comp.vertical_sample * 8;
+                let len = comp.sample_stride * comp.vertical_sample * comp.block_h;
 
                 comp.needed = true;
                 if comp.raw_coeff.len() != len {
@@ -1071,9 +1074,21 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                         // determine where to write.
                         let sl = &mut temp_channel[component.idct_pos..];
 
-                        component.idct_pos += 8;
+                        component.idct_pos += component.block_w;
                         // tmp now contains a dequantized block so idct it
-                        (self.idct_func)(&mut tmp, sl, component.width_stride);
+                        if let Some(average) = component.scaled_average {
+                            // A block reduced to fewer samples than 8 by 8: reconstruct it
+                            // whole and average it, unless only its mean is wanted.
+                            if component.block_w * component.block_h == 1 {
+                                sl[0] = dc_mean(tmp[0]);
+                            } else {
+                                let mut block = [0_i16; 64];
+                                (self.idct_func)(&mut tmp, &mut block, 8);
+                                average(&block, sl, component.sample_stride);
+                            }
+                        } else {
+                            (self.idct_func)(&mut tmp, sl, component.sample_stride);
+                        }
                     }
                     // after every write of 8, skip 7 since idct write stride wise 8 times.
                     //
@@ -1081,7 +1096,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     // sl
                     //
                     // and component.idct_pos is one stride long
-                    component.idct_pos += 7 * component.width_stride;
+                    component.idct_pos += (component.block_h - 1) * component.sample_stride;
                 }
                 component.idct_pos = 0;
             }

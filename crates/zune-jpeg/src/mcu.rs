@@ -21,7 +21,8 @@ use crate::decoder::{HeaderAppendStateSnapshot, McuDecodeOutput, MAX_COMPONENTS}
 use crate::errors::DecodeErrors;
 use crate::marker::Marker;
 use crate::mcu_prog::get_marker;
-use crate::misc::{calculate_padded_width, setup_component_params};
+use crate::idct::scaled::dc_mean;
+use crate::misc::setup_component_params;
 use crate::worker::{color_convert, upsample};
 use crate::JpegDecoder;
 
@@ -109,6 +110,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
         progressive_mcus: &mut [Vec<i16>; MAX_COMPONENTS], upsampler_scratch_space: &mut Vec<i16>,
     ) -> Result<(), DecodeErrors> {
         setup_component_params(self)?;
+        // Only pixel output is reconstructed at a reduced size.
+        let scaled = matches!(output, McuDecodeOutput::Pixels(_)) && self.output_scale() != (1, 1);
 
         let (mut mcu_width, mut mcu_height);
 
@@ -159,9 +162,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 self.info.height.div_ceil(8) as usize
             };
         }
-        let width = usize::from(self.info.width);
-
-        let padded_width = calculate_padded_width(width, self.info.sample_ratio);
+        self.set_block_sizes(scaled);
+        let (width, padded_width) = self.output_row_geometry();
 
         let mut stream = B::new();
         stream.set_strict(self.options.strict_mode());
@@ -195,7 +197,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // allocate enough space to hold a whole MCU width
                 // this means we should take into account sampling ratios
                 // `*8` is because each MCU spans 8 widths.
-                let len = comp.width_stride * comp.vertical_sample * 8;
+                let len = comp.sample_stride * comp.vertical_sample * comp.block_h;
 
                 comp.needed = true;
                 if !resuming || comp.raw_coeff.len() != len {
@@ -231,7 +233,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                     * component.vertical_sample
                     * component.horizontal_sample
                     * mcu_height
-                    * 64;
+                    * component.block_w
+                    * component.block_h;
                 if !resuming || mcu.len() != len {
                     mcu.clear();
                     mcu.resize(len, 0);
@@ -258,7 +261,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             stream.restore_snapshot(checkpoint.bitstream_state);
         }
 
-        let is_hv = usize::from(self.is_interleaved && !raw_mode);
+        let is_hv = usize::from(self.is_interleaved && !raw_mode && !self.is_scaled());
         let upsampler_scratch_size = is_hv
             * self
                 .components
@@ -880,7 +883,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         // Size of our output image(width*height)
         let raw_mode = output.is_raw();
-        let is_hv = usize::from(self.is_interleaved && !raw_mode);
+        let is_hv = usize::from(self.is_interleaved && !raw_mode && !self.is_scaled());
         let upsampler_scratch_size = is_hv
             * self
                 .components
@@ -889,8 +892,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 .max()
                 .unwrap_or(0)
             * 8;
-        let width = usize::from(self.info.width);
-        let padded_width = calculate_padded_width(width, self.info.sample_ratio);
+        let (width, padded_width) = self.output_row_geometry();
 
         let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
 
@@ -933,7 +935,7 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 // the size of its `raw_coeff`. It is not `block.len() / mcu_height`: for
                 // grayscale output of a vertically sampled image the scan buffers are sized
                 // for twice as many MCU rows (`self.coeff = 2`), while there are `mcu_y` stripes.
-                let step = component.width_stride * component.vertical_sample * 8;
+                let step = component.sample_stride * component.vertical_sample * component.block_h;
 
                 // where we will be reading our pixels from.
                 let slice = block[position]
@@ -1084,8 +1086,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 let qt_table = &component.quantization_table;
                 let channel = if PROGRESSIVE {
                     let offset = mcu_row
-                        .checked_mul(component.width_stride)
-                        .and_then(|x| x.checked_mul(8))
+                        .checked_mul(component.sample_stride)
+                        .and_then(|x| x.checked_mul(component.block_h))
                         .ok_or(DecodeErrors::FormatStatic("Overflow"))?;
                     // Small stopgap for https://github.com/etemesi254/zune-image/issues/362
                     if offset >= progressive[k].len() {
@@ -1181,24 +1183,41 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
                             let idct_position = if PROGRESSIVE {
                                 // For non-interleaved, j indexes data units directly
-                                j * 8
+                                j * component.block_w
                             } else {
                                 // derived from stb and rewritten for my tastes
-                                let c2 = v_samp * 8;
-                                let c3 = ((j * component.horizontal_sample) + h_samp) * 8;
+                                let c2 = v_samp * component.block_h;
+                                let c3 = ((j * component.horizontal_sample) + h_samp)
+                                    * component.block_w;
 
-                                component.width_stride * c2 + c3
+                                component.sample_stride * c2 + c3
                             };
 
                             let idct_pos = channel.get_mut(idct_position..).unwrap();
 
-                            if len <= 1 {
-                                (self.idct_1x1_func)(tmp, idct_pos, component.width_stride);
+                            if let Some(average) = component.scaled_average {
+                                // A block reduced to fewer samples than 8 by 8: reconstruct
+                                // it whole and average it, unless only its mean is wanted.
+                                if component.block_w * component.block_h == 1 {
+                                    idct_pos[0] = dc_mean(tmp[0]);
+                                } else {
+                                    let mut block = [0_i16; 64];
+                                    if len <= 1 {
+                                        (self.idct_1x1_func)(tmp, &mut block, 8);
+                                    } else if len <= 10 {
+                                        (self.idct_4x4_func)(tmp, &mut block, 8);
+                                    } else {
+                                        (self.idct_func)(tmp, &mut block, 8);
+                                    }
+                                    average(&block, idct_pos, component.sample_stride);
+                                }
+                            } else if len <= 1 {
+                                (self.idct_1x1_func)(tmp, idct_pos, component.sample_stride);
                             } else if len <= 10 {
-                                (self.idct_4x4_func)(tmp, idct_pos, component.width_stride);
+                                (self.idct_4x4_func)(tmp, idct_pos, component.sample_stride);
                             } else {
                                 //  call idct.
-                                (self.idct_func)(tmp, idct_pos, component.width_stride);
+                                (self.idct_func)(tmp, idct_pos, component.sample_stride);
                             }
                         }
                     }
@@ -1692,6 +1711,18 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
                 }
                 Ok(())
             };
+
+        if self.is_scaled() {
+            // Decoding at a reduced size reconstructs every component at the output's
+            // resolution, so the stripe's rows are converted as they are.
+            let mut channels_ref: [&[i16]; MAX_COMPONENTS] = [&[]; MAX_COMPONENTS];
+            for (channel, component) in channels_ref.iter_mut().zip(&self.components) {
+                *channel = &component.raw_coeff;
+            }
+            color_conv_function(self.v_max * self.block_size.1, channels_ref)?;
+            *pixels_written = px;
+            return Ok(());
+        }
 
         let comps = &mut self.components[..];
 
