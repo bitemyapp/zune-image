@@ -3910,6 +3910,34 @@ where
         Some((width.div_ceil(across), height.div_ceil(down)))
     }
 
+    /// Decode only the image's first `rows` rows (at its full size), for when the rest won't
+    /// be seen: decoding stops after the MCU row holding the last of them, and the image is
+    /// output as though it were that tall, so [`Self::dimensions`] and
+    /// [`Self::output_dimensions`] give `rows` as its height. The last rows decoded may
+    /// differ slightly from those of the whole image, where chroma is upsampled from the rows
+    /// below them.
+    ///
+    /// Call it after [`Self::decode_headers`]. Only sequential images whose first scan holds
+    /// all their components, and whose height isn't given by a DNL marker, are cut short;
+    /// returns whether this one is.
+    pub fn set_row_limit(&mut self, rows: usize) -> bool {
+        let applies = self.headers_decoded
+            && !self.is_progressive
+            && !self.expects_dnl
+            && usize::from(self.num_scans) == self.components.len()
+            && rows > 0
+            && rows < usize::from(self.info.height);
+        if applies {
+            // Below `info.height`, so it fits.
+            self.info.height = rows as u16;
+            // Decoding a scan starts again from the height it began with.
+            if let Some(state) = self.scan_state.as_mut() {
+                state.scan_start_height = self.info.height;
+            }
+        }
+        applies
+    }
+
     /// The denominators of the scales `decode` and `decode_into` reconstruct the image at
     /// across and down: the requested ones, or 1 and 1 where they aren't supported.
     /// Subsampled components are reconstructed at the output's resolution, so a component
